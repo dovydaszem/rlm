@@ -89,7 +89,9 @@ class LMRequestHandler(StreamRequestHandler):
 
         async def run_one(prompt: str):
             async with sem:
-                return await client.acompletion(prompt)
+                content = await client.acompletion(prompt)
+                # Read this call's usage before the next await, while it is still the last one.
+                return content, client.get_last_usage()
 
         async def run_all():
             tasks = [run_one(prompt) for prompt in request.prompts]
@@ -97,13 +99,13 @@ class LMRequestHandler(StreamRequestHandler):
             # batch; failures are surfaced per-prompt as error completions below.
             return await asyncio.gather(*tasks, return_exceptions=True)
 
-        results = asyncio.run(run_all())
+        # Run on the handler's long-lived loop: asyncio.run() would close its loop after
+        # each batch and break async clients whose connection pool is bound to it.
+        results = asyncio.run_coroutine_threadsafe(run_all(), handler.event_loop).result()
         end_time = time.perf_counter()
 
         total_time = end_time - start_time
-        model_usage = client.get_last_usage()
         root_model = request.model or client.model_name
-        usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
 
         chat_completions = []
         for prompt, content in zip(request.prompts, results, strict=True):
@@ -121,12 +123,13 @@ class LMRequestHandler(StreamRequestHandler):
                     )
                 )
             else:
+                content, model_usage = content
                 chat_completions.append(
                     RLMChatCompletion(
                         root_model=root_model,
                         prompt=prompt,
                         response=content,
-                        usage_summary=usage_summary,
+                        usage_summary=UsageSummary(model_usage_summaries={root_model: model_usage}),
                         execution_time=total_time
                         / len(request.prompts),  # approximate per-prompt time
                     )
@@ -166,6 +169,8 @@ class LMHandler:
         self._thread: Thread | None = None
         self._port = port
         self.batch_max_concurrent = batch_max_concurrent
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: Thread | None = None
 
         self.register_client(client.model_name, client)
 
@@ -213,6 +218,10 @@ class LMHandler:
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = Thread(target=self._loop.run_forever, daemon=True)
+        self._loop_thread.start()
+
         return self.address
 
     def stop(self):
@@ -221,6 +230,19 @@ class LMHandler:
             self._server.shutdown()
             self._server = None
             self._thread = None
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join(timeout=5)
+            self._loop.close()
+            self._loop = None
+            self._loop_thread = None
+
+    @property
+    def event_loop(self) -> asyncio.AbstractEventLoop:
+        """Long-lived event loop for batched async calls; runs while the handler is started."""
+        if self._loop is None:
+            raise RuntimeError("LMHandler is not started")
+        return self._loop
 
     def completion(self, prompt: str, model: str | None = None) -> str:
         """Direct completion call (for main process use)."""

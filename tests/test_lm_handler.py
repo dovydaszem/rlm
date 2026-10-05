@@ -65,3 +65,52 @@ def test_lm_handler_batched_many_prompts_semaphore_cap():
     for i, resp in enumerate(result):
         assert resp.success, (i, resp.error)
         assert resp.chat_completion.response == f"resp-{i}"
+
+
+class _LoopBoundMockLM(MockLM):
+    """Like an async HTTP client whose connection pool is tied to the first event loop it ran on,
+    with per-call usage equal to the prompt length."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._loop = None
+        self._last_tokens = 0
+
+    async def acompletion(self, prompt):
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = loop
+        elif loop is not self._loop:
+            raise RuntimeError("Event loop is closed")
+        await asyncio.sleep(0.01 * len(prompt) % 0.05)  # finish out of order
+        self._last_tokens = len(prompt)
+        return f"ok {prompt}"
+
+    def get_last_usage(self):
+        from rlm.core.types import ModelUsageSummary
+
+        return ModelUsageSummary(
+            total_calls=1, total_input_tokens=self._last_tokens, total_output_tokens=0
+        )
+
+
+def test_lm_handler_consecutive_batches_share_event_loop():
+    """A second batch must not fail on a client bound to the first batch's loop."""
+    mock = _LoopBoundMockLM()
+    with LMHandler(client=mock) as handler:
+        for _ in range(2):
+            result = send_lm_request_batched(handler.address, ["a", "b", "c"])
+            assert all(r.success for r in result), [r.error for r in result]
+
+
+def test_lm_handler_batched_usage_is_per_prompt():
+    """Each batched completion carries its own call's usage, not the last call's."""
+    mock = _LoopBoundMockLM()
+    prompts = ["x" * n for n in (5, 1, 3, 2, 4)]
+    with LMHandler(client=mock, batch_max_concurrent=5) as handler:
+        result = send_lm_request_batched(handler.address, prompts)
+    for prompt, resp in zip(prompts, result, strict=True):
+        usage = resp.chat_completion.usage_summary.model_usage_summaries["mock-model"]
+        assert usage.total_input_tokens == len(prompt)
